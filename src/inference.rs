@@ -1,20 +1,22 @@
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights;
+use candle_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
+use std::path::PathBuf;
 
 pub struct InferenceEngine {
     model: ModelWeights,
     tokenizer: Tokenizer,
     device: Device,
+    model_path: PathBuf, // <-- Save the path to instantly reload the memory
 }
 
 impl InferenceEngine {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         println!("Initializing Candle Inference Engine...");
-        let device = Device::Cpu; // Or Device::new_cuda(0) if you have an Nvidia GPU setup
+        let device = Device::Cpu;
 
-       // 1. Connect to Hugging Face for the heavy weights (These are already cached on your machine!)
         let api = Api::new()?;
         let weights_repo = api.repo(Repo::with_revision(
             "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF".to_string(),
@@ -25,11 +27,9 @@ impl InferenceEngine {
         println!("Loading model weights from cache...");
         let model_path = weights_repo.get("tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")?;
 
-        // 2. Load the Tokenizer from the local filesystem directly
         println!("Loading local tokenizer...");
         let tokenizer = Tokenizer::from_file("tokenizer.json").map_err(|e| e.to_string())?;
 
-        // 3. Load the Model Weights
         let mut file = std::fs::File::open(&model_path)?;
         let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
         let mut tensor_file = std::fs::File::open(&model_path)?;
@@ -41,24 +41,88 @@ impl InferenceEngine {
             model,
             tokenizer,
             device,
+            model_path, // <-- Store it here
         })
     }
 
     pub fn generate_response(&mut self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
-        // This is a simplified forward pass for demonstration.
-        // 1. Tokenize input
-        let tokens = self.tokenizer.encode(prompt, true).map_err(|e| e.to_string())?;
-        let token_ids = tokens.get_ids();
-        
-        // 2. Convert to Tensor
-        let input_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
-        
-        // 3. Run through the model (Forward Pass)
-        // In a full implementation, this loops to generate tokens one by one (autoregressive).
-        // For our architecture setup, we will mock the return to ensure the pipeline compiles.
-        let _logits = self.model.forward(&input_tensor, 0)?;
+        // --- THE MEMORY WIPE ---
+        // Instantly memory-map a fresh model to guarantee an empty KV cache
+        let mut file = std::fs::File::open(&self.model_path)?;
+        let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+        let mut tensor_file = std::fs::File::open(&self.model_path)?;
+        self.model = ModelWeights::from_gguf(gguf_content, &mut tensor_file, &self.device)?;
 
-        // Return a simulated response for now while we wire the agents
-        Ok(format!("AI Processed Prompt: '{}'. Synthesized output ready.", prompt))
+        // 1. Encode the prompt into numbers
+        let mut tokens = self.tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
+        
+        // 2. Initialize the token picker (Seed: 1337, Temperature: 0.1 for strict code gen)
+        let mut logits_processor = LogitsProcessor::new(1337, Some(0.1), None);
+        let eos_token = 2; // TinyLlama's stop token
+
+        let mut generated_tokens = Vec::new();
+        let mut prev_text_len = 0;
+        let mut generated_text = String::new();
+        let mut current_pos = 0;
+
+        println!("\n--- AI Neural Generation Stream ---");
+
+        let mut next_token = 0;
+        
+        // 1. Process the prompt one token at a time to build the KV cache safely
+        for (i, &token) in tokens.iter().enumerate() {
+            let input_tensor = Tensor::new(&[token], &self.device)?.unsqueeze(0)?;
+            let logits = self.model.forward(&input_tensor, current_pos)?;
+            current_pos += 1;
+            
+            if i == tokens.len() - 1 {
+                // Explicitly peel dimensions based on exact rank to guarantee a 1D tensor
+                let final_logits = if logits.rank() == 3 {
+                    logits.get(0)?.get(0)?
+                } else if logits.rank() == 2 {
+                    logits.get(0)?
+                } else {
+                    logits
+                }.to_dtype(candle_core::DType::F32)?;
+                
+                next_token = logits_processor.sample(&final_logits)?;
+            }
+        }
+
+        // 2. Autoregressive Loop
+        for _ in 0..250 {
+            if next_token == eos_token {
+                break;
+            }
+
+            generated_tokens.push(next_token);
+
+            // Decode the ENTIRE sequence so far to preserve spaces natively
+            if let Some(full_text) = self.tokenizer.decode(&generated_tokens, true).ok() {
+                let new_text = &full_text[prev_text_len..];
+                print!("{}", new_text);
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                prev_text_len = full_text.len();
+                generated_text = full_text; // Save the correctly spaced string
+            }
+
+            let input_tensor = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
+            let logits = self.model.forward(&input_tensor, current_pos)?;
+            current_pos += 1;
+
+            let final_logits = if logits.rank() == 3 {
+                logits.get(0)?.get(0)?
+            } else if logits.rank() == 2 {
+                logits.get(0)?
+            } else {
+                logits
+            }.to_dtype(candle_core::DType::F32)?;
+
+            next_token = logits_processor.sample(&final_logits)?;
+        }
+        
+        println!("\n-----------------------------------\n");
+        Ok(generated_text)
     }
 }

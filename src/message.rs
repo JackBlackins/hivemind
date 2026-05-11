@@ -1,6 +1,7 @@
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum AgentMessage {
     NewTask {
         task_id: Uuid,
