@@ -9,7 +9,7 @@ pub struct InferenceEngine {
     model: ModelWeights,
     tokenizer: Tokenizer,
     device: Device,
-    model_path: PathBuf, // <-- Save the path to instantly reload the memory
+    model_path: PathBuf, 
 }
 
 impl InferenceEngine {
@@ -41,25 +41,21 @@ impl InferenceEngine {
             model,
             tokenizer,
             device,
-            model_path, // <-- Store it here
+            model_path, 
         })
     }
 
     pub fn generate_response(&mut self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
-        // --- THE MEMORY WIPE ---
-        // Instantly memory-map a fresh model to guarantee an empty KV cache
+        
         let mut file = std::fs::File::open(&self.model_path)?;
         let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
         let mut tensor_file = std::fs::File::open(&self.model_path)?;
         self.model = ModelWeights::from_gguf(gguf_content, &mut tensor_file, &self.device)?;
 
-        // 1. Encode the prompt into numbers
-        let mut tokens = self.tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
+        let tokens = self.tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
         
-        // 2. Initialize the token picker (Seed: 1337, Temperature: 0.1 for strict code gen)
         let mut logits_processor = LogitsProcessor::new(1337, Some(0.1), None);
-        let eos_token = 2; // TinyLlama's stop token
-
+        let eos_token = 2; 
         let mut generated_tokens = Vec::new();
         let mut prev_text_len = 0;
         let mut generated_text = String::new();
@@ -68,15 +64,12 @@ impl InferenceEngine {
         println!("\n--- AI Neural Generation Stream ---");
 
         let mut next_token = 0;
-        
-        // 1. Process the prompt one token at a time to build the KV cache safely
         for (i, &token) in tokens.iter().enumerate() {
             let input_tensor = Tensor::new(&[token], &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward(&input_tensor, current_pos)?;
             current_pos += 1;
             
             if i == tokens.len() - 1 {
-                // Explicitly peel dimensions based on exact rank to guarantee a 1D tensor
                 let final_logits = if logits.rank() == 3 {
                     logits.get(0)?.get(0)?
                 } else if logits.rank() == 2 {
@@ -89,7 +82,6 @@ impl InferenceEngine {
             }
         }
 
-        // 2. Autoregressive Loop
         for _ in 0..250 {
             if next_token == eos_token {
                 break;
@@ -97,14 +89,13 @@ impl InferenceEngine {
 
             generated_tokens.push(next_token);
 
-            // Decode the ENTIRE sequence so far to preserve spaces natively
             if let Some(full_text) = self.tokenizer.decode(&generated_tokens, true).ok() {
                 let new_text = &full_text[prev_text_len..];
                 print!("{}", new_text);
                 use std::io::Write;
                 std::io::stdout().flush().unwrap();
                 prev_text_len = full_text.len();
-                generated_text = full_text; // Save the correctly spaced string
+                generated_text = full_text;
             }
 
             let input_tensor = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
